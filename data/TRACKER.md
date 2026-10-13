@@ -1,0 +1,1 @@
+No bets logged yet.
