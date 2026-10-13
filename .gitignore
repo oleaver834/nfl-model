@@ -1,0 +1,5 @@
+data/games.csv
+data/current_team_game_epa.csv
+data/current_qb_game.csv
+data/pbp_current.csv.gz
+__pycache__/
