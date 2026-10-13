@@ -51,7 +51,7 @@ def kickoffs(games):
 
 
 def due_window(games, now, state):
-    """Return the kickoff time ~24h out (within the next 23-25h) that hasn't been fetched yet."""
+    """Kickoff time ~24h out (within the next 23-25h) whose model refresh hasn't run yet."""
     g = kickoffs(games)
     soon = g[(g.kickoff >= now + timedelta(hours=23)) & (g.kickoff < now + timedelta(hours=25))]
     for k in sorted(soon.kickoff.unique()):
@@ -59,6 +59,26 @@ def due_window(games, now, state):
         if key not in state.get("fetched", []):
             return key
     return None
+
+
+def closing_due(games, now, state):
+    """Kickoff within the next 75 minutes whose closing line hasn't been captured yet."""
+    g = kickoffs(games)
+    soon = g[(g.kickoff > now) & (g.kickoff <= now + timedelta(minutes=75))]
+    for k in sorted(soon.kickoff.unique()):
+        key = pd.Timestamp(k).isoformat()
+        if key not in state.get("closed", []):
+            return key
+    return None
+
+
+def scan_due(games, now):
+    """Regular scan: every SCAN_EVERY_HOURS hours, 8am-11pm ET, when a game is within 4 days."""
+    every = int(os.environ.get("SCAN_EVERY_HOURS", "6") or 6)
+    if not (8 <= now.hour <= 23) or now.hour % every:
+        return False
+    g = kickoffs(games)
+    return bool(((g.kickoff > now) & (g.kickoff <= now + timedelta(days=4))).any())
 
 
 def rebuild_current_season(season):
@@ -131,41 +151,71 @@ def best_lines(odds):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--force", action="store_true", help="fetch now regardless of kickoff timing")
+    ap.add_argument("--force", action="store_true", help="pull odds and rebuild everything now")
     args = ap.parse_args()
-    state = json.load(open(STATE)) if os.path.exists(STATE) else {"fetched": []}
+    state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     download(GAMES_URL, os.path.join(D, "games.csv"))
     games = pd.read_csv(os.path.join(D, "games.csv"))
     now = datetime.now(timezone.utc).astimezone(ET)
-    key = due_window(games, now, state)
-    if not key and not args.force:
-        print("No kickoff ~24h out; nothing to do.")
-        return
-    api_key = os.environ.get("ODDS_API_KEY")
-    if not api_key:
-        sys.exit("ODDS_API_KEY secret is not set.")
-
-    season = int(games[games.home_score.isna()].season.min())
-    rebuild_current_season(season)
-    import model  # imported after data refresh so it reads the new files
-    from projections import project
-    proj = project(model)
-    proj.to_csv(os.path.join(D, "projections.csv"), index=False)
-
-    odds = fetch_odds(api_key)
     stamp = now.strftime("%Y-%m-%d %H:%M ET")
-    odds.insert(0, "pulled_at", stamp)
-    odds.to_csv(os.path.join(D, "odds_latest.csv"), index=False)
-    bl = best_lines(odds)
-    bl.insert(0, "pulled_at", stamp)
-    bl = bl.merge(proj, on="matchup", how="left")
-    bl.to_csv(os.path.join(D, "best_lines_vs_model.csv"), index=False)
 
-    if key:
-        state["fetched"] = (state.get("fetched", []) + [key])[-60:]
-    state["last_run"] = stamp
+    model_key = due_window(games, now, state)
+    close_key = closing_due(games, now, state)
+    scanning = scan_due(games, now)
+    pull = args.force or model_key or close_key or scanning
+    print(f"{stamp}: model refresh={bool(model_key or args.force)} closing={bool(close_key)} scan={scanning}")
+
+    if pull:
+        api_key = os.environ.get("ODDS_API_KEY")
+        if not api_key:
+            sys.exit("ODDS_API_KEY secret is not set.")
+        odds = fetch_odds(api_key)
+        odds.insert(0, "pulled_utc", now.astimezone(timezone.utc).isoformat())
+        os.makedirs(os.path.join(D, "odds_history"), exist_ok=True)
+        odds.to_csv(os.path.join(D, "odds_history", now.strftime("%Y-%m-%d_%H%M") + ".csv.gz"), index=False)
+        odds.insert(0, "pulled_at", stamp)
+        odds.to_csv(os.path.join(D, "odds_latest.csv"), index=False)
+
+        # stale-line scan on every pull
+        from scanner import scan, alert_text
+        sc = scan(odds, games)
+        if not sc.empty:
+            sc.insert(0, "pulled_at", stamp)
+            sc.to_csv(os.path.join(D, "ev_scan.csv"), index=False)
+            flagged = sc[sc.flag]
+            seen = set(state.get("alerted", []))
+            keys = flagged.matchup + "|" + flagged.book + "|" + flagged.bet + "|" + flagged.price.astype(str)
+            new = flagged[~keys.isin(seen)]
+            if len(new):
+                with open(os.path.join(D, "alert.md"), "w") as f:
+                    f.write(alert_text(new, stamp))
+                state["alerted"] = (list(seen) + list(keys[~keys.isin(seen)]))[-500:]
+            print(f"scan: {len(sc)} prices checked, {len(flagged)} flagged, {len(new)} new")
+
+        if model_key or args.force:
+            season = int(games[games.home_score.isna()].season.min())
+            rebuild_current_season(season)
+            import model  # imported after the data refresh so it reads the new files
+            from projections import project
+            proj = project(model)
+            proj.to_csv(os.path.join(D, "projections.csv"), index=False)
+            bl = best_lines(odds.drop(columns=["pulled_utc"]))
+            bl.insert(0, "pulled_at", stamp)
+            bl.merge(proj, on="matchup", how="left").to_csv(os.path.join(D, "best_lines_vs_model.csv"), index=False)
+            if model_key:
+                state["fetched"] = (state.get("fetched", []) + [model_key])[-60:]
+        if close_key:
+            state["closed"] = (state.get("closed", []) + [close_key])[-60:]
+        state["last_pull"] = stamp
+
+    # bet tracker runs every time (no API cost)
+    from tracker import track
+    t, summ = track(os.path.join(D, "bets.csv"), os.path.join(D, "odds_history"), games)
+    if t is not None and len(t):
+        t.to_csv(os.path.join(D, "bet_tracker.csv"), index=False)
+    if summ:
+        open(os.path.join(D, "TRACKER.md"), "w").write(summ + "\n")
     json.dump(state, open(STATE, "w"), indent=1)
-    print(f"Updated {len(bl)} games at {stamp}")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,21 @@
-name: Update NFL odds and projections
+name: Update NFL odds, scanner and tracker
 
 on:
   schedule:
-    - cron: "7 * * * *"   # hourly check; odds are only pulled ~24h before a kickoff window
+    - cron: "7 * * * *"   # hourly check; odds are only pulled when a scan, model refresh or closing line is due
   workflow_dispatch:
     inputs:
       force:
-        description: "Pull odds now regardless of kickoff timing"
+        description: "Pull odds and rebuild everything now"
         type: boolean
         default: false
+  push:
+    paths:
+      - "data/bets.csv"     # re-grade the tracker as soon as you log a bet
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: nfl-update
@@ -29,10 +33,18 @@ jobs:
       - name: Run update
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SCAN_EVERY_HOURS: ${{ vars.SCAN_EVERY_HOURS }}
         run: python update.py ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+      - name: Phone alert for new +EV lines
+        if: hashFiles('data/alert.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --title "+EV lines $(TZ=America/New_York date '+%a %b %-d %-I:%M %p')" --body-file data/alert.md
+          rm data/alert.md
       - name: Commit results
         run: |
           git config user.name "nfl-update-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || (git commit -m "Update odds and projections" && git push)
+          git diff --cached --quiet || (git commit -m "Update odds, scan and tracker" && git pull --rebase && git push)

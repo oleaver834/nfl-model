@@ -1,0 +1,5 @@
+date,book,game,market,pick,line,price,stake
+# Add one row per bet you place (delete nothing above this line). Examples:
+# 2026-10-17,DraftKings,NYJ@NE,spread,NE,-6.5,-120,10
+# 2026-10-17,FanDuel,CHI@ATL,total,Under,49.5,-110,10
+# 2026-10-17,BetMGM,NO@NYG,moneyline,NYG,,105,10
