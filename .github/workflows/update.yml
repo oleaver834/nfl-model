@@ -2,7 +2,9 @@ name: Update NFL odds, scanner and tracker
 
 on:
   schedule:
-    - cron: "7 * * * *"   # hourly check; odds are only pulled when a scan, model refresh or closing line is due
+    # Twice an hour, because GitHub drops most scheduled runs. Odds are only pulled when a
+    # scan, model refresh or closing line is actually due, so the extra checks cost nothing.
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       force:

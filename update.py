@@ -51,20 +51,23 @@ def kickoffs(games):
 
 
 def due_window(games, now, state):
-    """Kickoff time ~24h out (within the next 23-25h) whose model refresh hasn't run yet."""
+    """A slate 18-30h out whose model refresh hasn't run yet, keyed by game date.
+
+    Keyed by date rather than kickoff time so a Sunday with four kickoff windows
+    refreshes the model once, not four times.
+    """
     g = kickoffs(games)
-    soon = g[(g.kickoff >= now + timedelta(hours=23)) & (g.kickoff < now + timedelta(hours=25))]
-    for k in sorted(soon.kickoff.unique()):
-        key = pd.Timestamp(k).isoformat()
-        if key not in state.get("fetched", []):
-            return key
+    soon = g[(g.kickoff >= now + timedelta(hours=18)) & (g.kickoff < now + timedelta(hours=30))]
+    for d in sorted(soon.gameday.unique()):
+        if d not in state.get("fetched", []):
+            return d
     return None
 
 
 def closing_due(games, now, state):
-    """Kickoff within the next 75 minutes whose closing line hasn't been captured yet."""
+    """Kickoff within the next 3 hours whose closing line hasn't been captured yet."""
     g = kickoffs(games)
-    soon = g[(g.kickoff > now) & (g.kickoff <= now + timedelta(minutes=75))]
+    soon = g[(g.kickoff > now) & (g.kickoff <= now + timedelta(hours=3))]
     for k in sorted(soon.kickoff.unique()):
         key = pd.Timestamp(k).isoformat()
         if key not in state.get("closed", []):
@@ -72,10 +75,14 @@ def closing_due(games, now, state):
     return None
 
 
-def scan_due(games, now):
-    """Regular scan: every SCAN_EVERY_HOURS hours, 8am-11pm ET, when a game is within 4 days."""
+def scan_due(games, now, state):
+    """Regular scan: SCAN_EVERY_HOURS since the last pull, 8am-11pm ET, game within 4 days."""
     every = int(os.environ.get("SCAN_EVERY_HOURS", "6") or 6)
-    if not (8 <= now.hour <= 23) or now.hour % every:
+    if not (8 <= now.hour <= 23):
+        return False
+    last = state.get("last_scan")
+    # one hour of slack, so a run that lands early still counts as due
+    if last and now - datetime.fromisoformat(last) < timedelta(hours=every) - timedelta(hours=1):
         return False
     g = kickoffs(games)
     return bool(((g.kickoff > now) & (g.kickoff <= now + timedelta(days=4))).any())
@@ -161,7 +168,7 @@ def main():
 
     model_key = due_window(games, now, state)
     close_key = closing_due(games, now, state)
-    scanning = scan_due(games, now)
+    scanning = scan_due(games, now, state)
     pull = args.force or model_key or close_key or scanning
     print(f"{stamp}: model refresh={bool(model_key or args.force)} closing={bool(close_key)} scan={scanning}")
 
@@ -207,6 +214,8 @@ def main():
         if close_key:
             state["closed"] = (state.get("closed", []) + [close_key])[-60:]
         state["last_pull"] = stamp
+        # every pull runs the scanner, so any pull resets the scan clock
+        state["last_scan"] = now.isoformat()
 
     # bet tracker runs every time (no API cost)
     from tracker import track
